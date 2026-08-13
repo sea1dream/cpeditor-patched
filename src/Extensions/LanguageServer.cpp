@@ -24,9 +24,17 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QUrl>
 
 namespace Extensions
 {
+namespace
+{
+std::string localFileUri(const QString &path)
+{
+    return QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toString(QUrl::FullyEncoded).toStdString();
+}
+} // namespace
 
 LanguageServer::LanguageServer(QString const &lang)
 {
@@ -61,6 +69,13 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
     m_editor = editor;
     openFile = path;
     logger = log;
+    ++attachmentGeneration;
+    completionEditor = nullptr;
+    latestCompletionRequestId.clear();
+    disconnect(completionConnection);
+    completionConnection = connect(editor, &Editor::CodeEditor::completionRequested, this,
+                                   &LanguageServer::requestCompletion);
+    editor->setCompletionEnabled(SettingsManager::get("LSP/Use Autocomplete " + language).toBool());
 
     if (lsp == nullptr)
         return;
@@ -71,7 +86,7 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
         isInitialized = true;
     }
 
-    std::string uri = "file://" + path.toStdString();
+    std::string uri = localFileUri(path);
     std::string code = m_editor->toPlainText().toStdString();
     std::string lang;
 
@@ -90,12 +105,26 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
 
 void LanguageServer::closeDocument()
 {
-    LOG_WARN_IF(!isDocumentOpen(), "Cannot close the document, No document was open");
-    if (!isDocumentOpen())
-        return;
+    const bool hadAttachment = !m_editor.isNull() || !openFile.isEmpty();
+    if (isDocumentOpen())
+    {
+        std::string uri = localFileUri(openFile);
+        lsp->didClose(uri);
+    }
+    else if (hadAttachment)
+    {
+        LOG_WARN("Cannot notify the language server that the document closed; no live document is open");
+    }
 
-    std::string uri = "file://" + openFile.toStdString();
-    lsp->didClose(uri);
+    disconnect(completionConnection);
+    if (m_editor != nullptr)
+    {
+        m_editor->hideCompletionPopup();
+        m_editor->setCompletionEnabled(false);
+    }
+    ++attachmentGeneration;
+    latestCompletionRequestId.clear();
+    completionEditor = nullptr;
 
     openFile = "";
     logger = nullptr;
@@ -112,8 +141,39 @@ void LanguageServer::requestLinting()
     e.text = m_editor->toPlainText().toStdString();
     changes.push_back(e);
 
-    std::string uri = "file://" + openFile.toStdString();
+    std::string uri = localFileUri(openFile);
     lsp->didChange(uri, changes, true);
+}
+
+void LanguageServer::requestCompletion(int line, int character, int documentRevision, int cursorPosition, bool manual)
+{
+    if (m_editor == nullptr || !isDocumentOpen() || lsp == nullptr ||
+        !SettingsManager::get("LSP/Use Autocomplete " + language).toBool())
+    {
+        return;
+    }
+
+    // Always synchronize the current text immediately before completion. The
+    // linting timer may not have elapsed yet (or linting may be disabled).
+    std::vector<TextDocumentContentChangeEvent> changes;
+    TextDocumentContentChangeEvent change;
+    change.text = m_editor->toPlainText().toStdString();
+    changes.push_back(change);
+    const std::string uri = localFileUri(openFile);
+    lsp->didChange(uri, changes, false);
+
+    Position position;
+    position.line = line;
+    position.character = character;
+    CompletionContext context;
+    context.triggerKind = CompletionTriggerKind::Invoked;
+
+    latestCompletionRequestId = QString::fromStdString(lsp->completion(uri, position, context));
+    completionEditor = m_editor;
+    completionRevision = documentRevision;
+    completionCursorPosition = cursorPosition;
+    completionWasManual = manual;
+    completionAttachmentGeneration = attachmentGeneration;
 }
 
 bool LanguageServer::isDocumentOpen() const
@@ -123,6 +183,16 @@ bool LanguageServer::isDocumentOpen() const
 
 void LanguageServer::updateSettings()
 {
+    QPointer<Editor::CodeEditor> editorToReopen = m_editor;
+    MessageLogger *loggerToReopen = logger;
+    const QString pathToReopen = openFile;
+
+    // Detach the old editor connection before replacing the client. This is
+    // required even when the old client failed to start or both features were
+    // just disabled.
+    if (!m_editor.isNull() || !openFile.isEmpty())
+        closeDocument();
+
     if (lsp != nullptr)
     {
         LOG_INFO("Killing LSP");
@@ -131,26 +201,19 @@ void LanguageServer::updateSettings()
         delete lsp;
         lsp = nullptr;
     }
+    isInitialized = false;
 
-    if (m_editor != nullptr)
-        m_editor->clearSquiggle();
+    if (!editorToReopen.isNull())
+        editorToReopen->clearSquiggle();
 
     if (shouldCreateClient())
     {
         createClient();
-
         performConnection();
-        initializeLSP(openFile);
-
         LOG_INFO("Recreated Language server Process");
-        if (m_editor != nullptr)
+        if (!editorToReopen.isNull() && !pathToReopen.isEmpty())
         {
-            auto *tmpEditor = m_editor;
-            auto tmpPath = openFile;
-            auto *tmpLog = logger;
-            if (isDocumentOpen())
-                closeDocument();
-            openDocument(tmpPath, tmpEditor, tmpLog);
+            openDocument(pathToReopen, editorToReopen, loggerToReopen);
             LOG_INFO("Reopened document after restart");
         }
     }
@@ -160,10 +223,11 @@ void LanguageServer::updatePath(QString const &newPath)
 {
     if (lsp == nullptr || (openFile == newPath))
         return;
-    auto *tmpLogger = logger;
-    auto *tmpEditor = m_editor;
+    MessageLogger *tmpLogger = logger;
+    QPointer<Editor::CodeEditor> tmpEditor = m_editor;
     closeDocument();
-    openDocument(newPath, tmpEditor, tmpLogger);
+    if (!tmpEditor.isNull())
+        openDocument(newPath, tmpEditor, tmpLogger);
 }
 
 // Private methods
@@ -221,7 +285,7 @@ Editor::CodeEditor::SeverityLevel LanguageServer::lspSeverity(int in)
 void LanguageServer::initializeLSP(QString const &filePath)
 {
     QFileInfo info(filePath);
-    std::string uri = "file://" + info.absoluteDir().absolutePath().toStdString();
+    std::string uri = QUrl::fromLocalFile(info.absoluteDir().absolutePath()).toString(QUrl::FullyEncoded).toStdString();
     option<DocumentUri> rootUri(uri);
     lsp->initialize(rootUri);
 }
@@ -229,8 +293,13 @@ void LanguageServer::initializeLSP(QString const &filePath)
 
 void LanguageServer::onLSPServerNotificationArrived(QString const &method, QJsonObject const &param)
 {
-    if (method == "textDocument/publishDiagnostics" && m_editor != nullptr) // Linting
+    if (method == "textDocument/publishDiagnostics" && !m_editor.isNull()) // Linting
     {
+        const QString notificationUri = param.value("uri").toString();
+        const QString activeUri = QString::fromStdString(localFileUri(openFile));
+        if (notificationUri != activeUri)
+            return;
+
         m_editor->clearSquiggle();
         QJsonArray doc = QJsonDocument::fromVariant(param.toVariantMap()).object()["diagnostics"].toArray();
         for (auto e : doc)
@@ -258,26 +327,52 @@ void LanguageServer::onLSPServerNotificationArrived(QString const &method, QJson
     }
 }
 
-void LanguageServer::onLSPServerResponseArrived(QJsonObject const &method, // NOLINT: It can be made static.
-                                                QJsonObject const &param)
+void LanguageServer::onLSPServerResponseArrived(QString const &id, QJsonValue const &result)
 {
-    LOG_INFO("Response from Server has arrived");
+    if (!id.startsWith("textDocument/completion:"))
+    {
+        LOG_INFO("Response from Server has arrived");
+        return;
+    }
+
+    if (id != latestCompletionRequestId || completionEditor.isNull() || completionEditor != m_editor ||
+        completionAttachmentGeneration != attachmentGeneration || !completionEditor->hasFocus() ||
+        completionEditor->document()->revision() != completionRevision ||
+        completionEditor->textCursor().position() != completionCursorPosition)
+    {
+        return;
+    }
+
+    QJsonArray items;
+    if (result.isArray())
+        items = result.toArray();
+    else if (result.isObject())
+        items = result.toObject().value("items").toArray();
+
+    completionEditor->showCompletionItems(items, completionRevision, completionCursorPosition, completionWasManual);
 }
 
 void LanguageServer::onLSPServerRequestArrived(QString const &method, // NOLINT: It can be made static.
-                                               QJsonObject const &param, QJsonObject const &id)
+                                               QJsonObject const &param, QJsonValue const &id)
 {
     LOG_INFO("Request from Sever has arrived. " << INFO_OF(method));
 }
 
-void LanguageServer::onLSPServerErrorArrived(QJsonObject const &id, QJsonObject const &error)
+void LanguageServer::onLSPServerErrorArrived(QString const &id, QJsonObject const &error)
 {
-    QString ID;
+    const int errorCode = error.value("code").toInt();
+    if (id.startsWith("textDocument/completion:") &&
+        (id != latestCompletionRequestId || errorCode == -32800 || errorCode == -32801))
+    {
+        // Superseded completion requests are routinely cancelled by language
+        // servers while the user keeps typing. They are not user-facing errors.
+        return;
+    }
+
     QString ERR;
-    ID = QJsonDocument::fromVariant(id.toVariantMap()).toJson();
     ERR = QJsonDocument::fromVariant(error.toVariantMap()).toJson();
 
-    LOG_ERR("ID is \n" << ID);
+    LOG_ERR("ID is \n" << id);
     LOG_ERR("ERR is \n" << ERR);
 
     if (logger != nullptr)

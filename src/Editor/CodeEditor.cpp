@@ -50,11 +50,18 @@
 #include <KSyntaxHighlighting/Definition>
 #include <KSyntaxHighlighting/Format>
 #include <QApplication>
+#include <QAbstractItemView>
 #include <QFontDatabase>
+#include <QHBoxLayout>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QMimeData>
 #include <QPainter>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QScreen>
+#include <QSet>
+#include <QTimer>
 #include <QTextBlock>
 #include <QTextCharFormat>
 #include <QTextStream>
@@ -62,20 +69,413 @@
 
 namespace Editor
 {
+namespace
+{
+enum CompletionRole
+{
+    InsertTextRole = Qt::UserRole + 1,
+    HasRangeRole,
+    StartLineRole,
+    StartCharacterRole,
+    EndLineRole,
+    EndCharacterRole
+};
+
+QString cleanCompletionLabel(QString label)
+{
+    label = label.trimmed();
+    if (label.startsWith(QChar(0x2022)))
+        label.remove(0, 1);
+    return label.trimmed();
+}
+
+QString plainCompletionText(QString text, int insertTextFormat)
+{
+    if (insertTextFormat != 2)
+        return text;
+
+    // Be defensive if a server sends snippets despite the advertised plain
+    // text capability. Preserve placeholder defaults and remove tab stops.
+    const QRegularExpression placeholder(R"(\$\{\d+:([^{}]*)\})");
+    while (placeholder.match(text).hasMatch())
+        text.replace(placeholder, "\\1");
+    text.remove(QRegularExpression(R"(\$\{\d+\})"));
+    text.remove(QRegularExpression(R"(\$\d+)"));
+    text.replace("\\$", "$");
+    return text;
+}
+
+bool completionMatches(const QString &candidate, const QString &prefix)
+{
+    if (prefix.isEmpty())
+        return true;
+    if (candidate.startsWith(prefix, Qt::CaseInsensitive))
+        return true;
+
+    // Keep clangd's server order, but allow VS Code-style abbreviated input
+    // such as "pb" -> "push_back" while cached results are filtered locally.
+    int prefixIndex = 0;
+    for (const QChar character : candidate)
+    {
+        if (character.toCaseFolded() == prefix.at(prefixIndex).toCaseFolded() && ++prefixIndex == prefix.size())
+            return true;
+    }
+    return false;
+}
+
+class CompletionPopup final : public QListWidget
+{
+  public:
+    explicit CompletionPopup(QWidget *parent = nullptr) : QListWidget(parent)
+    {
+        setWindowFlags(Qt::ToolTip | Qt::FramelessWindowHint);
+        setFocusPolicy(Qt::NoFocus);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+        setSelectionMode(QAbstractItemView::SingleSelection);
+        setTextElideMode(Qt::ElideRight);
+        setUniformItemSizes(true);
+        setMaximumHeight(320);
+        setMinimumWidth(280);
+    }
+};
+} // namespace
+
 CodeEditor::CodeEditor(QWidget *widget) : QPlainTextEdit(widget)
 {
     highlighter = new Highlighter(document());
     sideBar = new CodeEditorSidebar(this);
     languageRepo = new LanguageRepository(SettingsHelper::getDefaultLanguage(), this);
+    completionPopup = new CompletionPopup(this);
+    completionTimer = new QTimer(this);
+    completionTimer->setSingleShot(true);
+    completionTimer->setInterval(80);
 
     connect(document(), &QTextDocument::blockCountChanged, this, &CodeEditor::updateSidebarGeometry);
     connect(this, &QPlainTextEdit::updateRequest, this, &CodeEditor::updateSidebarArea);
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &CodeEditor::highlightCurrentLine);
     connect(this, &QPlainTextEdit::cursorPositionChanged, this, &CodeEditor::highlightParentheses);
     connect(this, &QPlainTextEdit::selectionChanged, this, &CodeEditor::highlightOccurrences);
+    connect(completionTimer, &QTimer::timeout, this, &CodeEditor::scheduleAutomaticCompletion);
+    connect(completionPopup, &QListWidget::itemClicked, this, [this] { acceptCurrentCompletion(); });
+    connect(document(), &QTextDocument::contentsChanged, this, [this] {
+        if (applyingCompletion || !completionEnabled)
+            return;
+        if (!completionRefreshPending)
+        {
+            completionRefreshPending = true;
+            QTimer::singleShot(0, this, [this] {
+                completionRefreshPending = false;
+                if (!applyingCompletion && completionEnabled)
+                    refreshCompletionPopupFromCache();
+            });
+        }
+        completionTimer->start();
+    });
+    connect(this, &QPlainTextEdit::cursorPositionChanged, this, [this] {
+        if (!applyingCompletion && !completionRefreshPending && !refreshCompletionPopupFromCache())
+            hideCompletionPopup();
+    });
+    connect(this, &QPlainTextEdit::selectionChanged, this, [this] {
+        if (textCursor().hasSelection())
+            clearCompletionSession();
+    });
+    connect(verticalScrollBar(), &QScrollBar::valueChanged, this, [this] { hideCompletionPopup(); });
+    connect(horizontalScrollBar(), &QScrollBar::valueChanged, this, [this] { hideCompletionPopup(); });
 
     setCenterOnScroll(true);
     setMouseTracking(true);
+}
+
+void CodeEditor::setCompletionEnabled(bool enabled)
+{
+    completionEnabled = enabled;
+    if (!enabled)
+    {
+        completionTimer->stop();
+        clearCompletionSession();
+    }
+}
+
+void CodeEditor::hideCompletionPopup()
+{
+    if (completionPopup != nullptr)
+        completionPopup->hide();
+}
+
+void CodeEditor::clearCompletionSession()
+{
+    completionTimer->stop();
+    hideCompletionPopup();
+    completionItemsCache = QJsonArray();
+    completionSessionLine = -1;
+    completionSessionStart = -1;
+    completionRenderedRevision = -1;
+    completionRenderedCursorPosition = -1;
+    completionRenderedPrefix.clear();
+    completionSessionAllowsEmptyPrefix = false;
+}
+
+void CodeEditor::requestCompletion(bool manual)
+{
+    if (!completionEnabled || applyingCompletion || textCursor().hasSelection())
+        return;
+
+    const auto cursor = textCursor();
+    emit completionRequested(cursor.blockNumber(), cursor.positionInBlock(), document()->revision(),
+                             cursor.position(), manual);
+}
+
+void CodeEditor::scheduleAutomaticCompletion()
+{
+    if (!completionEnabled || applyingCompletion || !hasFocus() || textCursor().hasSelection())
+        return;
+
+    const auto cursor = textCursor();
+    const QString left = cursor.block().text().left(cursor.positionInBlock());
+    const bool memberTrigger = left.endsWith('.') || left.endsWith("->") || left.endsWith("::");
+    const auto identifierMatch = QRegularExpression(R"([A-Za-z_][A-Za-z0-9_]*$)").match(left);
+    const int prefixLength = identifierMatch.hasMatch() ? identifierMatch.capturedLength() : 0;
+
+    if (memberTrigger || prefixLength >= 1)
+        requestCompletion(false);
+}
+
+void CodeEditor::showCompletionItems(const QJsonArray &items, int documentRevision, int requestPosition, bool manual)
+{
+    if (!completionEnabled || !hasFocus() || textCursor().hasSelection() ||
+        document()->revision() != documentRevision || textCursor().position() != requestPosition)
+    {
+        return;
+    }
+
+    if (items.isEmpty())
+    {
+        clearCompletionSession();
+        return;
+    }
+
+    const auto cursor = textCursor();
+    const QString left = cursor.block().text().left(cursor.positionInBlock());
+    const auto identifierMatch = QRegularExpression(R"([A-Za-z_][A-Za-z0-9_]*$)").match(left);
+    const QString prefix = identifierMatch.hasMatch() ? identifierMatch.captured() : QString();
+
+    completionItemsCache = items;
+    completionSessionLine = cursor.blockNumber();
+    completionSessionStart = cursor.positionInBlock() - prefix.size();
+    const QString beforePrefix = left.left(completionSessionStart);
+    completionSessionAllowsEmptyPrefix = manual || beforePrefix.endsWith('.') || beforePrefix.endsWith("->") ||
+                                         beforePrefix.endsWith("::");
+    rebuildCompletionPopup(completionItemsCache, prefix);
+}
+
+bool CodeEditor::refreshCompletionPopupFromCache()
+{
+    if (!completionEnabled || completionItemsCache.isEmpty() || !hasFocus() || textCursor().hasSelection() ||
+        completionSessionLine < 0 || completionSessionStart < 0)
+    {
+        return false;
+    }
+
+    const auto cursor = textCursor();
+    if (cursor.blockNumber() != completionSessionLine || cursor.positionInBlock() < completionSessionStart)
+    {
+        clearCompletionSession();
+        return false;
+    }
+
+    const QString prefix = cursor.block().text().mid(completionSessionStart,
+                                                     cursor.positionInBlock() - completionSessionStart);
+    static const QRegularExpression identifierPrefix(R"([A-Za-z0-9_]*)");
+    const auto match = identifierPrefix.match(prefix);
+    if (!match.hasMatch() || match.capturedLength() != prefix.size())
+    {
+        clearCompletionSession();
+        return false;
+    }
+
+    if (prefix.isEmpty() && !completionSessionAllowsEmptyPrefix)
+    {
+        clearCompletionSession();
+        return false;
+    }
+
+    const bool documentChanged = document()->revision() != completionRenderedRevision;
+    const bool prefixChanged = prefix != completionRenderedPrefix;
+    if (!documentChanged && cursor.position() != completionRenderedCursorPosition)
+    {
+        // A plain cursor movement is not part of the typing session. Discard the
+        // cached edit range so completion in the middle of a word cannot leave
+        // an old suffix behind (for example, "vectorc").
+        clearCompletionSession();
+        return false;
+    }
+
+    if (documentChanged || prefixChanged || !completionPopup->isVisible())
+        rebuildCompletionPopup(completionItemsCache, prefix);
+    return true;
+}
+
+void CodeEditor::rebuildCompletionPopup(const QJsonArray &items, const QString &prefix)
+{
+    completionPopup->clear();
+    QSet<QString> seen;
+    for (const QJsonValue &value : items)
+    {
+        if (!value.isObject())
+            continue;
+
+        const QJsonObject item = value.toObject();
+        const QJsonObject textEdit = item.value("textEdit").toObject();
+        QString insertText = textEdit.value("newText").toString();
+        if (insertText.isEmpty())
+            insertText = item.value("insertText").toString();
+        if (insertText.isEmpty())
+            insertText = cleanCompletionLabel(item.value("label").toString());
+        insertText = plainCompletionText(insertText, item.value("insertTextFormat").toInt(1));
+        if (insertText.isEmpty() || seen.contains(insertText))
+            continue;
+        seen.insert(insertText);
+
+        QString displayName = item.value("filterText").toString();
+        if (displayName.isEmpty())
+            displayName = cleanCompletionLabel(item.value("label").toString());
+        if (displayName.isEmpty())
+            displayName = insertText;
+
+        if (!completionMatches(displayName, prefix) && !completionMatches(insertText, prefix))
+        {
+            continue;
+        }
+
+        QString detail = item.value("detail").toString().simplified();
+        QString displayText = displayName;
+        if (!detail.isEmpty() && detail != displayName)
+            displayText += "    " + detail;
+
+        auto *row = new QListWidgetItem(displayText, completionPopup);
+        row->setData(InsertTextRole, insertText);
+
+        // Keep the start of this completion session stable while the user keeps
+        // typing.  The end follows the current cursor so accepting a cached item
+        // replaces "p", "pu", ... instead of appending to it.
+        const auto cursor = textCursor();
+        int replacementEnd = cursor.positionInBlock();
+        const QString blockText = cursor.block().text();
+        while (replacementEnd < blockText.size())
+        {
+            const QChar character = blockText.at(replacementEnd);
+            if (!character.isLetterOrNumber() && character != '_')
+                break;
+            ++replacementEnd;
+        }
+        row->setData(HasRangeRole, true);
+        row->setData(StartLineRole, completionSessionLine);
+        row->setData(StartCharacterRole, completionSessionStart);
+        row->setData(EndLineRole, cursor.blockNumber());
+        row->setData(EndCharacterRole, replacementEnd);
+
+        row->setToolTip(detail);
+
+        if (completionPopup->count() >= 200)
+            break;
+    }
+
+    if (completionPopup->count() == 0)
+    {
+        completionRenderedRevision = document()->revision();
+        completionRenderedCursorPosition = textCursor().position();
+        completionRenderedPrefix = prefix;
+        completionPopup->hide();
+        return;
+    }
+
+    completionRenderedRevision = document()->revision();
+    completionRenderedCursorPosition = textCursor().position();
+    completionRenderedPrefix = prefix;
+    positionCompletionPopup();
+}
+
+void CodeEditor::positionCompletionPopup()
+{
+    if (completionPopup->count() == 0)
+        return;
+
+    completionPopup->setCurrentRow(0);
+    completionPopup->setFont(font());
+    const QColor background = getEditorColor(KSyntaxHighlighting::Theme::BackgroundColor);
+    const QColor foreground = getTextColor(KSyntaxHighlighting::Theme::Normal);
+    const QColor selection = getEditorColor(KSyntaxHighlighting::Theme::TextSelection);
+    completionPopup->setStyleSheet(
+        QString("QListWidget { background: %1; color: %2; border: 1px solid %3; padding: 2px; } "
+                "QListWidget::item { padding: 3px 6px; } QListWidget::item:selected { background: %4; color: %2; }")
+            .arg(background.name(), foreground.name(), foreground.darker(160).name(), selection.name()));
+
+    int width = 320;
+    const QFontMetrics metrics(completionPopup->font());
+    for (int i = 0; i < completionPopup->count() && i < 50; ++i)
+        width = qMax(width, metrics.horizontalAdvance(completionPopup->item(i)->text()) + 36);
+    QPoint point = viewport()->mapToGlobal(cursorRect().bottomLeft());
+    const QRect screen = QApplication::screenAt(point) != nullptr ? QApplication::screenAt(point)->availableGeometry()
+                                                                  : QApplication::primaryScreen()->availableGeometry();
+    const int popupWidth = qMin(qMin(width, 760), screen.width());
+    const int rowHeight = qMax(completionPopup->sizeHintForRow(0), fontMetrics().height() + 6);
+    const int popupHeight = qMin(qMin(completionPopup->count(), 12) * rowHeight + 6, screen.height());
+    completionPopup->resize(popupWidth, popupHeight);
+
+    if (point.y() + completionPopup->height() > screen.bottom() + 1)
+        point.setY(viewport()->mapToGlobal(cursorRect().topLeft()).y() - completionPopup->height());
+    point.setX(qBound(screen.left(), point.x(), screen.right() - completionPopup->width() + 1));
+    point.setY(qBound(screen.top(), point.y(), screen.bottom() - completionPopup->height() + 1));
+    completionPopup->move(point);
+    completionPopup->show();
+    completionPopup->raise();
+}
+
+void CodeEditor::acceptCurrentCompletion()
+{
+    auto *row = completionPopup->currentItem();
+    if (row == nullptr)
+        return;
+
+    applyingCompletion = true;
+    completionTimer->stop();
+    completionPopup->hide();
+
+    QTextCursor cursor(document());
+    if (row->data(HasRangeRole).toBool())
+    {
+        const int startLine = row->data(StartLineRole).toInt();
+        const int startCharacter = row->data(StartCharacterRole).toInt();
+        const int endLine = row->data(EndLineRole).toInt();
+        const int endCharacter = row->data(EndCharacterRole).toInt();
+        const QTextBlock startBlock = document()->findBlockByNumber(startLine);
+        const QTextBlock endBlock = document()->findBlockByNumber(endLine);
+        if (startBlock.isValid() && endBlock.isValid())
+        {
+            cursor.setPosition(startBlock.position() + qMin(startCharacter, startBlock.length() - 1));
+            cursor.setPosition(endBlock.position() + qMin(endCharacter, endBlock.length() - 1), QTextCursor::KeepAnchor);
+        }
+        else
+        {
+            cursor = textCursor();
+        }
+    }
+    else
+    {
+        cursor = textCursor();
+        const QString left = cursor.block().text().left(cursor.positionInBlock());
+        const auto match = QRegularExpression(R"([A-Za-z_][A-Za-z0-9_]*$)").match(left);
+        if (match.hasMatch())
+            cursor.movePosition(QTextCursor::Left, QTextCursor::KeepAnchor, match.capturedLength());
+    }
+
+    cursor.beginEditBlock();
+    cursor.insertText(row->data(InsertTextRole).toString());
+    cursor.endEditBlock();
+    setTextCursor(cursor);
+    applyingCompletion = false;
+    clearCompletionSession();
 }
 
 void CodeEditor::applySettings(const QString &lang)
@@ -341,6 +741,7 @@ void CodeEditor::toggleFold(const QTextBlock &startBlock)
 
 void CodeEditor::resizeEvent(QResizeEvent *e)
 {
+    hideCompletionPopup();
     QPlainTextEdit::resizeEvent(e);
     updateSidebarGeometry();
 }
@@ -395,6 +796,9 @@ void CodeEditor::paintEvent(QPaintEvent *e)
 
 void CodeEditor::focusOutEvent(QFocusEvent *e)
 {
+    // The completion list is a tooltip window and does not take focus. Hide it
+    // when the editor genuinely loses focus (tab switch, settings dialog, etc.).
+    clearCompletionSession();
     if (m_vimCursor)
     {
         setOverwriteMode(true); // makes a block cursor when focus is lost
@@ -442,6 +846,7 @@ bool CodeEditor::vimCursor() const
 
 void CodeEditor::wheelEvent(QWheelEvent *e)
 {
+    hideCompletionPopup();
     if (e->modifiers() == Qt::ControlModifier)
     {
         const auto sizes = QFontDatabase::standardSizes();
@@ -848,6 +1253,70 @@ int CodeEditor::getFirstVisibleBlock()
 
 void CodeEditor::keyPressEvent(QKeyEvent *e)
 {
+    if (completionEnabled && e->key() == Qt::Key_Space && e->modifiers() == Qt::ControlModifier)
+    {
+        completionTimer->stop();
+        requestCompletion(true);
+        return;
+    }
+
+    if (completionPopup->isVisible())
+    {
+        switch (e->key())
+        {
+        case Qt::Key_Enter:
+        case Qt::Key_Return:
+        case Qt::Key_Tab:
+            if (e->modifiers() == Qt::NoModifier)
+            {
+                acceptCurrentCompletion();
+                return;
+            }
+            hideCompletionPopup();
+            break;
+        case Qt::Key_Escape:
+            if (e->modifiers() == Qt::NoModifier)
+            {
+                completionTimer->stop();
+                clearCompletionSession();
+                return;
+            }
+            break;
+        case Qt::Key_Up:
+        {
+            if (e->modifiers() != Qt::NoModifier)
+                break;
+            const int row = completionPopup->currentRow();
+            completionPopup->setCurrentRow(row <= 0 ? completionPopup->count() - 1 : row - 1);
+            return;
+        }
+        case Qt::Key_Down:
+        {
+            if (e->modifiers() != Qt::NoModifier)
+                break;
+            const int row = completionPopup->currentRow();
+            completionPopup->setCurrentRow(row + 1 >= completionPopup->count() ? 0 : row + 1);
+            return;
+        }
+        case Qt::Key_PageUp:
+            if (e->modifiers() == Qt::NoModifier)
+            {
+                completionPopup->setCurrentRow(qMax(0, completionPopup->currentRow() - 8));
+                return;
+            }
+            break;
+        case Qt::Key_PageDown:
+            if (e->modifiers() == Qt::NoModifier)
+            {
+                completionPopup->setCurrentRow(qMin(completionPopup->count() - 1, completionPopup->currentRow() + 8));
+                return;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
     /* if(m_vimCursor) */
     /* { */
     /*     QPlainTextEdit::keyPressEvent(e); */

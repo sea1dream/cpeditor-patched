@@ -6,7 +6,8 @@
 	url = https://github.com/cpeditor/QtFindReplaceDialog
 [submodule "third_party/lsp-cpp"]
 	path = third_party/lsp-cpp
-	url = https://github.com/cpeditor/lsp-cpp
+	url = https://github.com/sea1dream/lsp-cpp
+	branch = cpeditor-7.0.2-completion-patch
 [submodule "third_party/testlib"]
 	path = third_party/testlib
 	url = https://github.com/MikeMirzayanov/testlib

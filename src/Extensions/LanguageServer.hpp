@@ -20,6 +20,9 @@
 
 #include "Editor/CodeEditor.hpp"
 #include <QJsonObject>
+#include <QJsonValue>
+#include <QMetaObject>
+#include <QPointer>
 #include <QProcess>
 
 class MessageLogger;
@@ -38,6 +41,7 @@ class LanguageServer : public QObject
     void openDocument(QString const &path, Editor::CodeEditor *editor, MessageLogger *log);
     void closeDocument();
     void requestLinting();
+    void requestCompletion(int line, int character, int documentRevision, int cursorPosition, bool manual);
 
     bool isDocumentOpen() const;
 
@@ -46,9 +50,9 @@ class LanguageServer : public QObject
 
   private slots:
     void onLSPServerNotificationArrived(QString const &method, QJsonObject const &param);
-    void onLSPServerResponseArrived(QJsonObject const &method, QJsonObject const &param);
-    void onLSPServerRequestArrived(QString const &method, QJsonObject const &param, QJsonObject const &id);
-    void onLSPServerErrorArrived(QJsonObject const &id, QJsonObject const &error);
+    void onLSPServerResponseArrived(QString const &id, QJsonValue const &result);
+    void onLSPServerRequestArrived(QString const &method, QJsonObject const &param, QJsonValue const &id);
+    void onLSPServerErrorArrived(QString const &id, QJsonObject const &error);
     void onLSPServerProcessError(QProcess::ProcessError const &error);
     void onLSPServerProcessFinished(int exitCode, QProcess::ExitStatus status);
     void onLSPServerNewStderr(const QString &content);
@@ -61,12 +65,20 @@ class LanguageServer : public QObject
     static Editor::CodeEditor::SeverityLevel lspSeverity(int in);
     void initializeLSP(QString const &filePath);
 
-    Editor::CodeEditor *m_editor = nullptr;
+    QPointer<Editor::CodeEditor> m_editor;
     MessageLogger *logger = nullptr;
     LSPClient *lsp = nullptr;
     bool isInitialized = false;
     QString language;
     QString openFile;
+    QString latestCompletionRequestId;
+    QPointer<Editor::CodeEditor> completionEditor;
+    int completionRevision = -1;
+    int completionCursorPosition = -1;
+    bool completionWasManual = false;
+    quint64 attachmentGeneration = 0;
+    quint64 completionAttachmentGeneration = 0;
+    QMetaObject::Connection completionConnection;
 };
 } // namespace Extensions
 

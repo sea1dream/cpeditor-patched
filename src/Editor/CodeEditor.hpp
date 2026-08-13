@@ -44,8 +44,12 @@
 
 #include "HighLighter.hpp"
 #include <KSyntaxHighlighting/Theme>
+#include <QJsonArray>
 #include <QPlainTextEdit>
 #include <utility>
+
+class QListWidget;
+class QTimer;
 
 namespace KSyntaxHighlighting
 {
@@ -136,11 +140,18 @@ class CodeEditor : public QPlainTextEdit
 
     void applySettings(const QString &lang);
 
+    void setCompletionEnabled(bool enabled);
+    void showCompletionItems(const QJsonArray &items, int documentRevision, int requestPosition, bool manual);
+    void hideCompletionPopup();
+
   signals:
     /**
      * @brief Signal, the font is changed by the wheel event.
      */
     void fontChanged(const QFont &newFont);
+
+    /** Request LSP completions for the current UTF-16 cursor position. */
+    void completionRequested(int line, int character, int documentRevision, int cursorPosition, bool manual);
 
   public slots:
     /**
@@ -257,6 +268,8 @@ class CodeEditor : public QPlainTextEdit
 
     void highlightCurrentLine();
 
+    void scheduleAutomaticCompletion();
+
   private:
     /**
      * @brief Method for getting character under
@@ -264,6 +277,13 @@ class CodeEditor : public QPlainTextEdit
      * @param offset Offset to cursor.
      */
     QChar charUnderCursor(int offset = 0) const;
+
+    void requestCompletion(bool manual);
+    void acceptCurrentCompletion();
+    bool refreshCompletionPopupFromCache();
+    void rebuildCompletionPopup(const QJsonArray &items, const QString &prefix);
+    void positionCompletionPopup();
+    void clearCompletionSession();
 
     bool surroundedByCharInSingleLine(QChar c, int position, bool espace = true) const;
 
@@ -341,6 +361,19 @@ class CodeEditor : public QPlainTextEdit
     QString language;
 
     LanguageRepository *languageRepo;
+
+    QListWidget *completionPopup = nullptr;
+    QTimer *completionTimer = nullptr;
+    QJsonArray completionItemsCache;
+    int completionSessionLine = -1;
+    int completionSessionStart = -1;
+    int completionRenderedRevision = -1;
+    int completionRenderedCursorPosition = -1;
+    QString completionRenderedPrefix;
+    bool completionSessionAllowsEmptyPrefix = false;
+    bool completionRefreshPending = false;
+    bool completionEnabled = false;
+    bool applyingCompletion = false;
 
     friend class CodeEditorSidebar;
 };

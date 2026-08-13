@@ -864,12 +864,9 @@ void AppWindow::onTabChanged(int index)
         findReplaceDialog->setTextEdit(nullptr);
         setWindowTitle(tr("CP Editor: An editor specially designed for competitive programming"));
 
-        if (cppServer->isDocumentOpen())
-            cppServer->closeDocument();
-        if (pythonServer->isDocumentOpen())
-            pythonServer->closeDocument();
-        if (javaServer->isDocumentOpen())
-            javaServer->closeDocument();
+        cppServer->closeDocument();
+        pythonServer->closeDocument();
+        javaServer->closeDocument();
 
         return;
     }
@@ -1536,12 +1533,9 @@ void AppWindow::reAttachLanguageServer(MainWindow *window)
     lspTimerJava->stop();
     lspTimerPython->stop();
 
-    if (cppServer->isDocumentOpen())
-        cppServer->closeDocument();
-    if (javaServer->isDocumentOpen())
-        javaServer->closeDocument();
-    if (pythonServer->isDocumentOpen())
-        pythonServer->closeDocument();
+    cppServer->closeDocument();
+    javaServer->closeDocument();
+    pythonServer->closeDocument();
 
     if (window->getLanguage() == "C++")
     {

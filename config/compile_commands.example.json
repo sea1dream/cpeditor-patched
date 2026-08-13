@@ -1,0 +1,13 @@
+[
+  {
+    "directory": "D:/CP Editor",
+    "file": "D:/CP Editor/__cpeditor_template.cpp",
+    "arguments": [
+      "D:/msys64/ucrt64/bin/g++.exe",
+      "-std=gnu++20",
+      "-DLOCAL",
+      "-c",
+      "D:/CP Editor/__cpeditor_template.cpp"
+    ]
+  }
+]

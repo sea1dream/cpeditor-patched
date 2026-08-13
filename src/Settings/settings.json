@@ -725,6 +725,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting C++"
+      },
+      {
+        "name": "LSP/Use Autocomplete C++"
       }
     ],
     "tip": "The path to the C++ Language Server executable"
@@ -739,6 +742,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting Java"
+      },
+      {
+        "name": "LSP/Use Autocomplete Java"
       }
     ],
     "tip": "The path to the Java Language Server executable"
@@ -754,6 +760,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting Python"
+      },
+      {
+        "name": "LSP/Use Autocomplete Python"
       }
     ],
     "tip": "The path to the Python Language Server executable"
@@ -778,21 +787,21 @@
   },
   {
     "name": "LSP/Use Autocomplete C++",
-    "desc": "Use auto-complete with Language Server",
+    "desc": "Use code completion with Language Server",
     "type": "bool",
-    "tip": "Use autocomplete results from Language server"
+    "tip": "Show code completion suggestions from the language server while typing. Press Ctrl+Space to request suggestions manually."
   },
   {
     "name": "LSP/Use Autocomplete Java",
-    "desc": "Use auto-complete with Language Server",
+    "desc": "Use code completion with Language Server",
     "type": "bool",
-    "tip": "Use autocomplete results from Language server"
+    "tip": "Show code completion suggestions from the language server while typing. Press Ctrl+Space to request suggestions manually."
   },
   {
     "name": "LSP/Use Autocomplete Python",
-    "desc": "Use auto-complete with Language Server",
+    "desc": "Use code completion with Language Server",
     "type": "bool",
-    "tip": "Use autocomplete results from Language server"
+    "tip": "Show code completion suggestions from the language server while typing. Press Ctrl+Space to request suggestions manually."
   },
   {
     "name": "LSP/Delay C++",
@@ -800,9 +809,13 @@
     "desc": "Delay in Linting (ms)",
     "default": 2000,
     "param": "QVariantList {10, 3600000, 1000}",
+    "requireAllDepends": false,
     "depends": [
       {
         "name": "LSP/Use Linting C++"
+      },
+      {
+        "name": "LSP/Use Autocomplete C++"
       }
     ],
     "tip": "Delay in linting in milliseconds after last modification to code"
@@ -813,9 +826,13 @@
     "desc": "Delay in Linting (ms)",
     "default": 2000,
     "param": "QVariantList {10, 3600000, 1000}",
+    "requireAllDepends": false,
     "depends": [
       {
         "name": "LSP/Use Linting Java"
+      },
+      {
+        "name": "LSP/Use Autocomplete Java"
       }
     ],
     "tip": "Delay in linting in milliseconds after last modification to code"
@@ -826,9 +843,13 @@
     "desc": "Delay in Linting (ms)",
     "default": 2000,
     "param": "QVariantList {10, 3600000, 1000}",
+    "requireAllDepends": false,
     "depends": [
       {
         "name": "LSP/Use Linting Python"
+      },
+      {
+        "name": "LSP/Use Autocomplete Python"
       }
     ],
     "tip": "Delay in linting in milliseconds after last modification to code"
@@ -841,6 +862,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting C++"
+      },
+      {
+        "name": "LSP/Use Autocomplete C++"
       }
     ],
     "tip": "Arguments to pass to Language server executable"
@@ -853,6 +877,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting Java"
+      },
+      {
+        "name": "LSP/Use Autocomplete Java"
       }
     ],
     "tip": "Arguments to pass to Language server executable"
@@ -866,6 +893,9 @@
     "depends": [
       {
         "name": "LSP/Use Linting Python"
+      },
+      {
+        "name": "LSP/Use Autocomplete Python"
       }
     ],
     "tip": "Arguments to pass to Language server executable"
