@@ -144,6 +144,9 @@ class CodeEditor : public QPlainTextEdit
     void showCompletionItems(const QJsonArray &items, int documentRevision, int requestPosition, bool manual);
     void hideCompletionPopup();
 
+    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision);
+    void clearSemanticHighlights();
+
   signals:
     /**
      * @brief Signal, the font is changed by the wheel event.

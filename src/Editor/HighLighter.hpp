@@ -45,11 +45,56 @@
 #include <KSyntaxHighlighting/AbstractHighlighter>
 
 #include <KSyntaxHighlighting/State>
+#include <KSyntaxHighlighting/Theme>
+#include <QColor>
+#include <QHash>
 #include <QSyntaxHighlighter>
+#include <QVector>
 #include <unordered_map>
 
 namespace Editor
 {
+
+/** Semantic token kinds understood by the editor highlighter.
+ *
+ * Positions passed to Highlighter::setSemanticHighlights use zero-based lines
+ * and UTF-16 code-unit offsets, matching both LSP's default encoding and
+ * QString/QTextDocument positions.
+ */
+enum class SemanticHighlightKind : quint8
+{
+    Unknown,
+    Namespace,
+    Type,
+    Class,
+    Enum,
+    Interface,
+    Struct,
+    TypeParameter,
+    Parameter,
+    Variable,
+    Property,
+    EnumMember,
+    Event,
+    Function,
+    Method,
+    Macro,
+    Label,
+    Keyword,
+    Number,
+    Operator,
+    Bracket,
+    Comment
+};
+
+struct SemanticHighlight
+{
+    int line = 0;
+    int start = 0;
+    int length = 0;
+    SemanticHighlightKind kind = SemanticHighlightKind::Unknown;
+    quint32 modifiers = 0;
+};
 
 /**
  * Attribute storage
@@ -79,6 +124,7 @@ class TextBlockUserData : public QTextBlockUserData
     KSyntaxHighlighting::State state;
     QList<KSyntaxHighlighting::FoldingRegion> foldingRegions;
     std::vector<Attribute> attributes;
+    int cxxBracketDepth = 0;
 };
 
 /** A QSyntaxHighlighter implementation for use with QTextDocument.
@@ -121,6 +167,15 @@ class Highlighter : public QSyntaxHighlighter, public KSyntaxHighlighting::Abstr
 
     KSyntaxHighlighting::Format getFormat(int pos);
 
+    /** Replace the semantic overlay for the current document revision.
+     *
+     * This method must be called on the highlighter's (GUI) thread. Stale
+     * revisions are retained but never painted, so asynchronous LSP replies
+     * cannot color a newer document accidentally.
+     */
+    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision);
+    void clearSemanticHighlights();
+
   protected:
     void highlightBlock(const QString &text) override;
     void applyFormat(int offset, int length, const KSyntaxHighlighting::Format &format) override;
@@ -129,12 +184,23 @@ class Highlighter : public QSyntaxHighlighter, public KSyntaxHighlighting::Abstr
   private:
     static KSyntaxHighlighting::FoldingRegion foldingRegion(const QTextBlock &startBlock);
 
+    void applyCxxFallback(const QString &text, int &bracketDepth);
+    void applySemanticHighlights(int blockNumber);
+    void overrideForeground(int offset, int length, const QColor &color);
+    bool isProtectedCxxSyntax(int offset) const;
+    QColor semanticColor(SemanticHighlightKind kind) const;
+    QColor textStyleColor(KSyntaxHighlighting::Theme::TextStyle style, const char *draculaColor) const;
+    void rehighlightSemanticDiff(const QHash<int, QVector<SemanticHighlight>> &oldHighlights, int oldRevision);
+
     QList<KSyntaxHighlighting::FoldingRegion> foldingRegions;
 
     std::vector<KSyntaxHighlighting::Format> m_formats;
     std::unordered_map<quint16, short> m_formatsIdToIndex;
 
     std::vector<Attribute> m_attributes;
+    QHash<int, QVector<SemanticHighlight>> m_semanticHighlights;
+    int m_semanticRevision = -1;
+    bool m_isCxxDefinition = false;
 };
 
 } // namespace Editor

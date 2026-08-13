@@ -34,12 +34,64 @@ std::string localFileUri(const QString &path)
 {
     return QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toString(QUrl::FullyEncoded).toStdString();
 }
+
+Editor::SemanticHighlightKind semanticHighlightKind(const QString &tokenType)
+{
+    using Kind = Editor::SemanticHighlightKind;
+
+    if (tokenType == "namespace")
+        return Kind::Namespace;
+    if (tokenType == "type" || tokenType == "concept")
+        return Kind::Type;
+    if (tokenType == "class")
+        return Kind::Class;
+    if (tokenType == "enum")
+        return Kind::Enum;
+    if (tokenType == "interface")
+        return Kind::Interface;
+    if (tokenType == "struct")
+        return Kind::Struct;
+    if (tokenType == "typeParameter")
+        return Kind::TypeParameter;
+    if (tokenType == "parameter")
+        return Kind::Parameter;
+    if (tokenType == "variable")
+        return Kind::Variable;
+    if (tokenType == "property")
+        return Kind::Property;
+    if (tokenType == "enumMember")
+        return Kind::EnumMember;
+    if (tokenType == "event")
+        return Kind::Event;
+    if (tokenType == "function")
+        return Kind::Function;
+    if (tokenType == "method")
+        return Kind::Method;
+    if (tokenType == "macro")
+        return Kind::Macro;
+    if (tokenType == "label")
+        return Kind::Label;
+    if (tokenType == "keyword" || tokenType == "modifier")
+        return Kind::Keyword;
+    if (tokenType == "number")
+        return Kind::Number;
+    if (tokenType == "operator")
+        return Kind::Operator;
+    if (tokenType == "bracket")
+        return Kind::Bracket;
+    if (tokenType == "comment")
+        return Kind::Comment;
+    return Kind::Unknown;
+}
 } // namespace
 
 LanguageServer::LanguageServer(QString const &lang)
 {
     LOG_INFO(INFO_OF(lang));
     this->language = lang;
+    semanticTokensTimer.setInterval(150);
+    semanticTokensTimer.setSingleShot(true);
+    connect(&semanticTokensTimer, &QTimer::timeout, this, &LanguageServer::requestSemanticTokens);
     if (shouldCreateClient())
     {
         createClient();
@@ -72,10 +124,19 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
     ++attachmentGeneration;
     completionEditor = nullptr;
     latestCompletionRequestId.clear();
+    semanticTokensTimer.stop();
+    latestSemanticTokensRequestId.clear();
+    semanticTokensEditor = nullptr;
+    semanticTokensRevision = -1;
+    semanticTokensUri.clear();
+    lastSyncedRevision = -1;
+    lastDiagnosticsRevision = -1;
     disconnect(completionConnection);
-    completionConnection = connect(editor, &Editor::CodeEditor::completionRequested, this,
-                                   &LanguageServer::requestCompletion);
+    disconnect(semanticChangeConnection);
+    completionConnection =
+        connect(editor, &Editor::CodeEditor::completionRequested, this, &LanguageServer::requestCompletion);
     editor->setCompletionEnabled(SettingsManager::get("LSP/Use Autocomplete " + language).toBool());
+    editor->clearSemanticHighlights();
 
     if (lsp == nullptr)
         return;
@@ -101,6 +162,21 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
     }
 
     lsp->didOpen(uri, code, lang);
+    lastSyncedRevision = m_editor->document()->revision();
+
+    if (language == "C++")
+    {
+        // QSyntaxHighlighter formatting also emits contentsChanged(). Listen
+        // to the granular signal and ignore format-only updates, otherwise a
+        // semantic response would rehighlight the document and schedule the
+        // next semantic request forever.
+        semanticChangeConnection = connect(editor->document(), &QTextDocument::contentsChange, this,
+                                           [this](int, int charsRemoved, int charsAdded) {
+                                               if (charsRemoved > 0 || charsAdded > 0)
+                                                   scheduleSemanticTokens();
+                                           });
+        scheduleSemanticTokens();
+    }
 }
 
 void LanguageServer::closeDocument()
@@ -116,15 +192,24 @@ void LanguageServer::closeDocument()
         LOG_WARN("Cannot notify the language server that the document closed; no live document is open");
     }
 
+    semanticTokensTimer.stop();
     disconnect(completionConnection);
+    disconnect(semanticChangeConnection);
     if (m_editor != nullptr)
     {
         m_editor->hideCompletionPopup();
         m_editor->setCompletionEnabled(false);
+        m_editor->clearSemanticHighlights();
     }
     ++attachmentGeneration;
     latestCompletionRequestId.clear();
     completionEditor = nullptr;
+    latestSemanticTokensRequestId.clear();
+    semanticTokensEditor = nullptr;
+    semanticTokensRevision = -1;
+    semanticTokensUri.clear();
+    lastSyncedRevision = -1;
+    lastDiagnosticsRevision = -1;
 
     openFile = "";
     logger = nullptr;
@@ -136,13 +221,7 @@ void LanguageServer::requestLinting()
     if (m_editor == nullptr || !isDocumentOpen())
         return;
 
-    std::vector<TextDocumentContentChangeEvent> changes;
-    TextDocumentContentChangeEvent e;
-    e.text = m_editor->toPlainText().toStdString();
-    changes.push_back(e);
-
-    std::string uri = localFileUri(openFile);
-    lsp->didChange(uri, changes, true);
+    syncDocument(true);
 }
 
 void LanguageServer::requestCompletion(int line, int character, int documentRevision, int cursorPosition, bool manual)
@@ -153,14 +232,10 @@ void LanguageServer::requestCompletion(int line, int character, int documentRevi
         return;
     }
 
-    // Always synchronize the current text immediately before completion. The
-    // linting timer may not have elapsed yet (or linting may be disabled).
-    std::vector<TextDocumentContentChangeEvent> changes;
-    TextDocumentContentChangeEvent change;
-    change.text = m_editor->toPlainText().toStdString();
-    changes.push_back(change);
     const std::string uri = localFileUri(openFile);
-    lsp->didChange(uri, changes, false);
+    // Completion has the shortest debounce. It synchronizes immediately; the
+    // later semantic-token request reuses this same document revision.
+    syncDocument(false);
 
     Position position;
     position.line = line;
@@ -240,9 +315,137 @@ bool LanguageServer::shouldCreateClient()
 void LanguageServer::createClient()
 {
     delete lsp;
+    initializationRequestId.clear();
+    semanticTokenTypes.clear();
+    latestSemanticTokensRequestId.clear();
     auto program = SettingsManager::get("LSP/Path " + language).toString();
     auto args = QProcess::splitCommand(SettingsManager::get("LSP/Args " + language).toString().trimmed());
     lsp = new LSPClient(program, args);
+}
+
+void LanguageServer::scheduleSemanticTokens()
+{
+    if (language != "C++" || lsp == nullptr || m_editor.isNull() || !isDocumentOpen())
+        return;
+
+    semanticTokensTimer.start();
+}
+
+void LanguageServer::requestSemanticTokens()
+{
+    if (language != "C++" || lsp == nullptr || m_editor.isNull() || !isDocumentOpen() || semanticTokenTypes.isEmpty())
+        return;
+
+    const int revision = m_editor->document()->revision();
+    const QString uriString = QString::fromStdString(localFileUri(openFile));
+    const std::string uri = uriString.toStdString();
+
+    // Avoid sending a second full document when completion already synchronized
+    // this revision a few milliseconds earlier.
+    syncDocument(false);
+
+    latestSemanticTokensRequestId = QString::fromStdString(lsp->semanticTokens(uri));
+    semanticTokensEditor = m_editor;
+    semanticTokensRevision = revision;
+    semanticTokensUri = uriString;
+    semanticTokensAttachmentGeneration = attachmentGeneration;
+}
+
+void LanguageServer::syncDocument(bool wantDiagnostics)
+{
+    if (lsp == nullptr || m_editor.isNull() || !isDocumentOpen())
+        return;
+
+    const int revision = m_editor->document()->revision();
+    if (revision == lastSyncedRevision && (!wantDiagnostics || revision == lastDiagnosticsRevision))
+        return;
+
+    std::vector<TextDocumentContentChangeEvent> changes;
+    TextDocumentContentChangeEvent change;
+    change.text = m_editor->toPlainText().toStdString();
+    changes.push_back(std::move(change));
+    lsp->didChange(localFileUri(openFile), changes, wantDiagnostics);
+    lastSyncedRevision = revision;
+    if (wantDiagnostics)
+        lastDiagnosticsRevision = revision;
+}
+
+void LanguageServer::handleInitializeResponse(const QJsonValue &result)
+{
+    semanticTokenTypes.clear();
+
+    const QJsonObject capabilities = result.toObject().value("capabilities").toObject();
+    const QJsonObject provider = capabilities.value("semanticTokensProvider").toObject();
+    const QJsonArray tokenTypes = provider.value("legend").toObject().value("tokenTypes").toArray();
+    for (const QJsonValue &tokenType : tokenTypes)
+    {
+        if (tokenType.isString())
+            semanticTokenTypes.push_back(tokenType.toString());
+    }
+
+    // Complete the standard LSP initialization handshake. clangd tolerated
+    // older CP Editor versions omitting this notification, but semantic-token
+    // requests should only begin after initialization is complete.
+    if (lsp != nullptr)
+        lsp->initialized();
+
+    if (!semanticTokenTypes.isEmpty() && !m_editor.isNull() && isDocumentOpen())
+        semanticTokensTimer.start();
+}
+
+void LanguageServer::handleSemanticTokensResponse(const QJsonValue &result)
+{
+    if (semanticTokensEditor.isNull() || semanticTokensEditor != m_editor ||
+        semanticTokensAttachmentGeneration != attachmentGeneration || semanticTokensUri.isEmpty() ||
+        semanticTokensUri != QString::fromStdString(localFileUri(openFile)) ||
+        semanticTokensEditor->document()->revision() != semanticTokensRevision)
+    {
+        return;
+    }
+
+    const QJsonArray data = result.toObject().value("data").toArray();
+    if (data.size() % 5 != 0)
+        return;
+    QVector<Editor::SemanticHighlight> highlights;
+    highlights.reserve(data.size() / 5);
+    int line = 0;
+    int character = 0;
+
+    for (int i = 0; i + 4 < data.size(); i += 5)
+    {
+        const int deltaLine = data.at(i).toInt(-1);
+        const int deltaStart = data.at(i + 1).toInt(-1);
+        if (deltaLine < 0 || deltaStart < 0)
+            return;
+
+        if (deltaLine == 0)
+            character += deltaStart;
+        else
+        {
+            line += deltaLine;
+            character = deltaStart;
+        }
+
+        const int length = data.at(i + 2).toInt(-1);
+        const int tokenTypeIndex = data.at(i + 3).toInt(-1);
+        const int tokenModifiers = data.at(i + 4).toInt();
+        if (length <= 0 || tokenTypeIndex < 0 || tokenTypeIndex >= semanticTokenTypes.size())
+            continue;
+
+        const Editor::SemanticHighlightKind kind = semanticHighlightKind(semanticTokenTypes.at(tokenTypeIndex));
+        if (kind == Editor::SemanticHighlightKind::Unknown)
+            continue;
+
+        Editor::SemanticHighlight highlight;
+        highlight.line = line;
+        highlight.start = character;
+        highlight.length = length;
+        highlight.kind = kind;
+        highlight.modifiers = static_cast<quint32>(tokenModifiers);
+        highlights.push_back(highlight);
+    }
+
+    semanticTokensEditor->setSemanticHighlights(highlights, semanticTokensRevision);
 }
 
 void LanguageServer::performConnection()
@@ -287,7 +490,7 @@ void LanguageServer::initializeLSP(QString const &filePath)
     QFileInfo info(filePath);
     std::string uri = QUrl::fromLocalFile(info.absoluteDir().absolutePath()).toString(QUrl::FullyEncoded).toStdString();
     option<DocumentUri> rootUri(uri);
-    lsp->initialize(rootUri);
+    initializationRequestId = QString::fromStdString(lsp->initialize(rootUri));
 }
 // ---------------------------- LSP SLOTS ------------------------
 
@@ -329,6 +532,19 @@ void LanguageServer::onLSPServerNotificationArrived(QString const &method, QJson
 
 void LanguageServer::onLSPServerResponseArrived(QString const &id, QJsonValue const &result)
 {
+    if (!initializationRequestId.isEmpty() && id == initializationRequestId)
+    {
+        handleInitializeResponse(result);
+        return;
+    }
+
+    if (id.startsWith("textDocument/semanticTokens/full:"))
+    {
+        if (id == latestSemanticTokensRequestId)
+            handleSemanticTokensResponse(result);
+        return;
+    }
+
     if (!id.startsWith("textDocument/completion:"))
     {
         LOG_INFO("Response from Server has arrived");
@@ -361,6 +577,11 @@ void LanguageServer::onLSPServerRequestArrived(QString const &method, // NOLINT:
 void LanguageServer::onLSPServerErrorArrived(QString const &id, QJsonObject const &error)
 {
     const int errorCode = error.value("code").toInt();
+    if (id.startsWith("textDocument/semanticTokens/full:") &&
+        (id != latestSemanticTokensRequestId || errorCode == -32800 || errorCode == -32801))
+    {
+        return;
+    }
     if (id.startsWith("textDocument/completion:") &&
         (id != latestCompletionRequestId || errorCode == -32800 || errorCode == -32801))
     {
@@ -413,6 +634,10 @@ void LanguageServer::onLSPServerProcessError(QProcess::ProcessError const &error
 
 void LanguageServer::onLSPServerProcessFinished(int exitCode, QProcess::ExitStatus status)
 {
+    semanticTokensTimer.stop();
+    latestSemanticTokensRequestId.clear();
+    if (!m_editor.isNull())
+        m_editor->clearSemanticHighlights();
     LOG_INFO_IF(exitCode == 0, "LSP Finished with exit code " << exitCode << INFO_OF(language) << INFO_OF(status));
     LOG_WARN_IF(exitCode != 0, "LSP Finished with exit code " << exitCode << INFO_OF(language) << INFO_OF(status));
 }

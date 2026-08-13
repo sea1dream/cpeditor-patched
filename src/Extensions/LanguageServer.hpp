@@ -24,6 +24,8 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QProcess>
+#include <QStringList>
+#include <QTimer>
 
 class MessageLogger;
 class LSPClient;
@@ -61,6 +63,11 @@ class LanguageServer : public QObject
     void performConnection();
     void createClient();
     bool shouldCreateClient();
+    void scheduleSemanticTokens();
+    void requestSemanticTokens();
+    void syncDocument(bool wantDiagnostics);
+    void handleInitializeResponse(const QJsonValue &result);
+    void handleSemanticTokensResponse(const QJsonValue &result);
 
     static Editor::CodeEditor::SeverityLevel lspSeverity(int in);
     void initializeLSP(QString const &filePath);
@@ -71,6 +78,9 @@ class LanguageServer : public QObject
     bool isInitialized = false;
     QString language;
     QString openFile;
+    int lastSyncedRevision = -1;
+    int lastDiagnosticsRevision = -1;
+    QString initializationRequestId;
     QString latestCompletionRequestId;
     QPointer<Editor::CodeEditor> completionEditor;
     int completionRevision = -1;
@@ -79,6 +89,15 @@ class LanguageServer : public QObject
     quint64 attachmentGeneration = 0;
     quint64 completionAttachmentGeneration = 0;
     QMetaObject::Connection completionConnection;
+
+    QTimer semanticTokensTimer;
+    QStringList semanticTokenTypes;
+    QString latestSemanticTokensRequestId;
+    QString semanticTokensUri;
+    QPointer<Editor::CodeEditor> semanticTokensEditor;
+    int semanticTokensRevision = -1;
+    quint64 semanticTokensAttachmentGeneration = 0;
+    QMetaObject::Connection semanticChangeConnection;
 };
 } // namespace Extensions
 

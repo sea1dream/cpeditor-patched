@@ -13,6 +13,10 @@ portable layout and adds fixes developed for competitive-programming use.
   and `::`.
 - Filters cached results immediately while typing, refreshes clangd after an
   80 ms debounce, and supports abbreviated matches such as `pb` -> `push_back`.
+- Adds clangd semantic highlighting for C++ functions, types, parameters,
+  variables, constants, keywords, and operators.
+- Adds Dracula-compatible operator colors and rainbow bracket pairs while
+  keeping comments, strings, numbers, and `#include` paths intact.
 - Handles split/combined LSP frames, unique request IDs, UTF-16 positions,
   stale responses, and document/tab lifetime changes.
 

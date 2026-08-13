@@ -203,6 +203,18 @@ void CodeEditor::hideCompletionPopup()
         completionPopup->hide();
 }
 
+void CodeEditor::setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision)
+{
+    if (highlighter != nullptr)
+        highlighter->setSemanticHighlights(highlights, documentRevision);
+}
+
+void CodeEditor::clearSemanticHighlights()
+{
+    if (highlighter != nullptr)
+        highlighter->clearSemanticHighlights();
+}
+
 void CodeEditor::clearCompletionSession()
 {
     completionTimer->stop();
