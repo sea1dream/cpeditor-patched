@@ -143,7 +143,18 @@ class CompletionPopup final : public QListWidget
 
 CodeEditor::CodeEditor(QWidget *widget) : QPlainTextEdit(widget)
 {
+    // QTextDocument::revision() also advances for format-only operations made
+    // by QSyntaxHighlighter. Track real character changes separately so an
+    // asynchronous semantic-token reply survives formatting and auto-save.
+    connect(document(), &QTextDocument::contentsChange, this, [this](int, int charsRemoved, int charsAdded) {
+        if (charsRemoved <= 0 && charsAdded <= 0)
+            return;
+        ++contentGeneration;
+        if (highlighter != nullptr)
+            highlighter->setContentGeneration(contentGeneration);
+    });
     highlighter = new Highlighter(document());
+    highlighter->setContentGeneration(contentGeneration);
     sideBar = new CodeEditorSidebar(this);
     languageRepo = new LanguageRepository(SettingsHelper::getDefaultLanguage(), this);
     completionPopup = new CompletionPopup(this);
@@ -203,16 +214,21 @@ void CodeEditor::hideCompletionPopup()
         completionPopup->hide();
 }
 
-void CodeEditor::setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision)
+void CodeEditor::setSemanticHighlights(const QVector<SemanticHighlight> &highlights, quint64 generation)
 {
     if (highlighter != nullptr)
-        highlighter->setSemanticHighlights(highlights, documentRevision);
+        highlighter->setSemanticHighlights(highlights, generation);
 }
 
 void CodeEditor::clearSemanticHighlights()
 {
     if (highlighter != nullptr)
         highlighter->clearSemanticHighlights();
+}
+
+quint64 CodeEditor::semanticContentGeneration() const
+{
+    return contentGeneration;
 }
 
 void CodeEditor::clearCompletionSession()

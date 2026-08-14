@@ -167,14 +167,16 @@ class Highlighter : public QSyntaxHighlighter, public KSyntaxHighlighting::Abstr
 
     KSyntaxHighlighting::Format getFormat(int pos);
 
-    /** Replace the semantic overlay for the current document revision.
+    /** Replace the semantic overlay for the current text generation.
      *
      * This method must be called on the highlighter's (GUI) thread. Stale
-     * revisions are retained but never painted, so asynchronous LSP replies
-     * cannot color a newer document accidentally.
+     * Generations are controlled by CodeEditor and only advance for actual
+     * text changes, unlike QTextDocument::revision(), which also changes for
+     * formatting operations.
      */
-    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision);
+    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, quint64 contentGeneration);
     void clearSemanticHighlights();
+    void setContentGeneration(quint64 contentGeneration);
 
   protected:
     void highlightBlock(const QString &text) override;
@@ -190,7 +192,8 @@ class Highlighter : public QSyntaxHighlighter, public KSyntaxHighlighting::Abstr
     bool isProtectedCxxSyntax(int offset) const;
     QColor semanticColor(SemanticHighlightKind kind) const;
     QColor textStyleColor(KSyntaxHighlighting::Theme::TextStyle style, const char *draculaColor) const;
-    void rehighlightSemanticDiff(const QHash<int, QVector<SemanticHighlight>> &oldHighlights, int oldRevision);
+    void rehighlightSemanticDiff(const QHash<int, QVector<SemanticHighlight>> &oldHighlights,
+                                 quint64 oldGeneration, bool oldHadGeneration);
 
     QList<KSyntaxHighlighting::FoldingRegion> foldingRegions;
 
@@ -199,7 +202,9 @@ class Highlighter : public QSyntaxHighlighter, public KSyntaxHighlighting::Abstr
 
     std::vector<Attribute> m_attributes;
     QHash<int, QVector<SemanticHighlight>> m_semanticHighlights;
-    int m_semanticRevision = -1;
+    quint64 m_contentGeneration = 0;
+    quint64 m_semanticGeneration = 0;
+    bool m_hasSemanticGeneration = false;
     bool m_isCxxDefinition = false;
 };
 

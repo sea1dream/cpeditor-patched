@@ -144,8 +144,9 @@ class CodeEditor : public QPlainTextEdit
     void showCompletionItems(const QJsonArray &items, int documentRevision, int requestPosition, bool manual);
     void hideCompletionPopup();
 
-    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision);
+    void setSemanticHighlights(const QVector<SemanticHighlight> &highlights, quint64 contentGeneration);
     void clearSemanticHighlights();
+    quint64 semanticContentGeneration() const;
 
   signals:
     /**
@@ -374,6 +375,7 @@ class CodeEditor : public QPlainTextEdit
     int completionRenderedCursorPosition = -1;
     QString completionRenderedPrefix;
     bool completionSessionAllowsEmptyPrefix = false;
+    quint64 contentGeneration = 0;
     bool completionRefreshPending = false;
     bool completionEnabled = false;
     bool applyingCompletion = false;

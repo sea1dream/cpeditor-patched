@@ -95,7 +95,7 @@ class LanguageServer : public QObject
     QString latestSemanticTokensRequestId;
     QString semanticTokensUri;
     QPointer<Editor::CodeEditor> semanticTokensEditor;
-    int semanticTokensRevision = -1;
+    quint64 semanticTokensGeneration = 0;
     quint64 semanticTokensAttachmentGeneration = 0;
     QMetaObject::Connection semanticChangeConnection;
 };

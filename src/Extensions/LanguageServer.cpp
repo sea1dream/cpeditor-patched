@@ -127,7 +127,7 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
     semanticTokensTimer.stop();
     latestSemanticTokensRequestId.clear();
     semanticTokensEditor = nullptr;
-    semanticTokensRevision = -1;
+    semanticTokensGeneration = 0;
     semanticTokensUri.clear();
     lastSyncedRevision = -1;
     lastDiagnosticsRevision = -1;
@@ -206,7 +206,7 @@ void LanguageServer::closeDocument()
     completionEditor = nullptr;
     latestSemanticTokensRequestId.clear();
     semanticTokensEditor = nullptr;
-    semanticTokensRevision = -1;
+    semanticTokensGeneration = 0;
     semanticTokensUri.clear();
     lastSyncedRevision = -1;
     lastDiagnosticsRevision = -1;
@@ -234,7 +234,7 @@ void LanguageServer::requestCompletion(int line, int character, int documentRevi
 
     const std::string uri = localFileUri(openFile);
     // Completion has the shortest debounce. It synchronizes immediately; the
-    // later semantic-token request reuses this same document revision.
+    // later semantic-token request can reuse the same document contents.
     syncDocument(false);
 
     Position position;
@@ -336,17 +336,17 @@ void LanguageServer::requestSemanticTokens()
     if (language != "C++" || lsp == nullptr || m_editor.isNull() || !isDocumentOpen() || semanticTokenTypes.isEmpty())
         return;
 
-    const int revision = m_editor->document()->revision();
+    const quint64 contentGeneration = m_editor->semanticContentGeneration();
     const QString uriString = QString::fromStdString(localFileUri(openFile));
     const std::string uri = uriString.toStdString();
 
     // Avoid sending a second full document when completion already synchronized
-    // this revision a few milliseconds earlier.
+    // these contents a few milliseconds earlier.
     syncDocument(false);
 
     latestSemanticTokensRequestId = QString::fromStdString(lsp->semanticTokens(uri));
     semanticTokensEditor = m_editor;
-    semanticTokensRevision = revision;
+    semanticTokensGeneration = contentGeneration;
     semanticTokensUri = uriString;
     semanticTokensAttachmentGeneration = attachmentGeneration;
 }
@@ -397,9 +397,15 @@ void LanguageServer::handleSemanticTokensResponse(const QJsonValue &result)
 {
     if (semanticTokensEditor.isNull() || semanticTokensEditor != m_editor ||
         semanticTokensAttachmentGeneration != attachmentGeneration || semanticTokensUri.isEmpty() ||
-        semanticTokensUri != QString::fromStdString(localFileUri(openFile)) ||
-        semanticTokensEditor->document()->revision() != semanticTokensRevision)
+        semanticTokensUri != QString::fromStdString(localFileUri(openFile)))
     {
+        return;
+    }
+
+    if (semanticTokensEditor->semanticContentGeneration() != semanticTokensGeneration)
+    {
+        LOG_INFO("Discarding stale semantic-token response and scheduling a refresh");
+        scheduleSemanticTokens();
         return;
     }
 
@@ -445,7 +451,9 @@ void LanguageServer::handleSemanticTokensResponse(const QJsonValue &result)
         highlights.push_back(highlight);
     }
 
-    semanticTokensEditor->setSemanticHighlights(highlights, semanticTokensRevision);
+    semanticTokensEditor->setSemanticHighlights(highlights, semanticTokensGeneration);
+    LOG_INFO("Applied " << highlights.size() << " semantic highlights for text generation "
+                         << semanticTokensGeneration);
 }
 
 void LanguageServer::performConnection()
@@ -577,10 +585,15 @@ void LanguageServer::onLSPServerRequestArrived(QString const &method, // NOLINT:
 void LanguageServer::onLSPServerErrorArrived(QString const &id, QJsonObject const &error)
 {
     const int errorCode = error.value("code").toInt();
-    if (id.startsWith("textDocument/semanticTokens/full:") &&
-        (id != latestSemanticTokensRequestId || errorCode == -32800 || errorCode == -32801))
+    if (id.startsWith("textDocument/semanticTokens/full:"))
     {
-        return;
+        if (id != latestSemanticTokensRequestId)
+            return;
+        if (errorCode == -32800 || errorCode == -32801)
+        {
+            scheduleSemanticTokens();
+            return;
+        }
     }
     if (id.startsWith("textDocument/completion:") &&
         (id != latestCompletionRequestId || errorCode == -32800 || errorCode == -32801))
@@ -634,6 +647,8 @@ void LanguageServer::onLSPServerProcessError(QProcess::ProcessError const &error
 
 void LanguageServer::onLSPServerProcessFinished(int exitCode, QProcess::ExitStatus status)
 {
+    if (sender() != lsp)
+        return;
     semanticTokensTimer.stop();
     latestSemanticTokensRequestId.clear();
     if (!m_editor.isNull())

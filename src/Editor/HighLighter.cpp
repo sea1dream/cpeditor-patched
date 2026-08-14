@@ -87,10 +87,18 @@ Highlighter::~Highlighter() = default;
 
 void Highlighter::setDefinition(const KSyntaxHighlighting::Definition &def)
 {
+    const bool newIsCxxDefinition =
+        def.name() == QLatin1String("C++") || def.name() == QLatin1String("ISO C++");
     m_formatsIdToIndex.clear();
-    m_semanticHighlights.clear();
-    m_semanticRevision = -1;
-    m_isCxxDefinition = def.name() == QLatin1String("C++") || def.name() == QLatin1String("ISO C++");
+    // Applying appearance/editor settings calls setDefinition() again even
+    // when the language is still C++. Preserve the current semantic overlay
+    // in that case; otherwise it disappears until the next text edit.
+    if (!m_isCxxDefinition || !newIsCxxDefinition)
+    {
+        m_semanticHighlights.clear();
+        m_hasSemanticGeneration = false;
+    }
+    m_isCxxDefinition = newIsCxxDefinition;
     AbstractHighlighter::setDefinition(def);
 
     auto definitions = def.includedDefinitions();
@@ -221,13 +229,13 @@ void Highlighter::highlightBlock(const QString &text)
         const QPointer<QTextDocument> guardedDocument(currentDocument);
         const QPointer<Highlighter> guardedHighlighter(this);
         const int blockNumber = nextBlock.blockNumber();
-        const int documentRevision = currentDocument->revision();
+        const quint64 contentGeneration = m_contentGeneration;
         QMetaObject::invokeMethod(
             this,
-            [guardedHighlighter, guardedDocument, blockNumber, documentRevision]() {
+            [guardedHighlighter, guardedDocument, blockNumber, contentGeneration]() {
                 if (!guardedHighlighter || !guardedDocument ||
                     guardedHighlighter->document() != guardedDocument.data() ||
-                    guardedDocument->revision() != documentRevision)
+                    guardedHighlighter->m_contentGeneration != contentGeneration)
                 {
                     return;
                 }
@@ -311,14 +319,18 @@ void Highlighter::applyFolding(int offset, int length, KSH::FoldingRegion region
     }
 }
 
-void Highlighter::setSemanticHighlights(const QVector<SemanticHighlight> &highlights, int documentRevision)
+void Highlighter::setSemanticHighlights(const QVector<SemanticHighlight> &highlights, quint64 contentGeneration)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    if (contentGeneration != m_contentGeneration)
+        return;
 
     const auto oldHighlights = m_semanticHighlights;
-    const int oldRevision = m_semanticRevision;
+    const quint64 oldGeneration = m_semanticGeneration;
+    const bool oldHadGeneration = m_hasSemanticGeneration;
     m_semanticHighlights.clear();
-    m_semanticRevision = documentRevision;
+    m_semanticGeneration = contentGeneration;
+    m_hasSemanticGeneration = true;
     for (const auto &highlight : highlights)
     {
         if (highlight.line < 0 || highlight.start < 0 || highlight.length <= 0)
@@ -335,45 +347,53 @@ void Highlighter::setSemanticHighlights(const QVector<SemanticHighlight> &highli
                       return left.length < right.length;
                   });
     }
-    rehighlightSemanticDiff(oldHighlights, oldRevision);
+    rehighlightSemanticDiff(oldHighlights, oldGeneration, oldHadGeneration);
 }
 
 void Highlighter::clearSemanticHighlights()
 {
     Q_ASSERT(thread() == QThread::currentThread());
-    if (m_semanticHighlights.isEmpty() && m_semanticRevision < 0)
+    if (m_semanticHighlights.isEmpty() && !m_hasSemanticGeneration)
         return;
 
     const auto oldHighlights = m_semanticHighlights;
-    const int oldRevision = m_semanticRevision;
+    const quint64 oldGeneration = m_semanticGeneration;
+    const bool oldHadGeneration = m_hasSemanticGeneration;
     m_semanticHighlights.clear();
-    m_semanticRevision = -1;
-    rehighlightSemanticDiff(oldHighlights, oldRevision);
+    m_hasSemanticGeneration = false;
+    rehighlightSemanticDiff(oldHighlights, oldGeneration, oldHadGeneration);
 }
 
-void Highlighter::rehighlightSemanticDiff(const QHash<int, QVector<SemanticHighlight>> &oldHighlights, int oldRevision)
+void Highlighter::setContentGeneration(quint64 contentGeneration)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    m_contentGeneration = contentGeneration;
+}
+
+void Highlighter::rehighlightSemanticDiff(const QHash<int, QVector<SemanticHighlight>> &oldHighlights,
+                                          quint64 oldGeneration, bool oldHadGeneration)
 {
     auto *const currentDocument = document();
     if (!currentDocument)
         return;
 
-    // An overlay from an older revision may still be baked into QTextLayout
+    // An overlay from an older text generation may still be baked into QTextLayout
     // formats of blocks that the edit did not touch. Its ranges no longer map
     // safely to the current document, so clear it with one full pass. Updates
-    // within one revision can stay block-local.
-    if (oldRevision >= 0 && oldRevision != currentDocument->revision())
+    // within one generation can stay block-local.
+    if (oldHadGeneration && oldGeneration != m_contentGeneration)
     {
         rehighlight();
         return;
     }
 
     QSet<int> dirtyBlocks;
-    if (oldRevision == currentDocument->revision())
+    if (oldHadGeneration && oldGeneration == m_contentGeneration)
     {
         for (auto it = oldHighlights.cbegin(); it != oldHighlights.cend(); ++it)
             dirtyBlocks.insert(it.key());
     }
-    if (m_semanticRevision == currentDocument->revision())
+    if (m_hasSemanticGeneration && m_semanticGeneration == m_contentGeneration)
     {
         for (auto it = m_semanticHighlights.cbegin(); it != m_semanticHighlights.cend(); ++it)
             dirtyBlocks.insert(it.key());
@@ -488,8 +508,7 @@ QColor Highlighter::semanticColor(SemanticHighlightKind kind) const
 
 void Highlighter::applySemanticHighlights(int blockNumber)
 {
-    auto *const currentDocument = document();
-    if (!currentDocument || m_semanticRevision != currentDocument->revision())
+    if (!document() || !m_hasSemanticGeneration || m_semanticGeneration != m_contentGeneration)
         return;
 
     const auto it = m_semanticHighlights.constFind(blockNumber);
