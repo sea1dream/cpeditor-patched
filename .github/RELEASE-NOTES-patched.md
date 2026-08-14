@@ -1,4 +1,4 @@
-## CP Editor 7.0.2 patched.2
+## CP Editor 7.0.2 patched.3
 
 Unofficial personal Windows x64 portable build based on CP Editor 7.0.2.
 
@@ -14,6 +14,10 @@ Highlights:
   numbers, and `#include` paths preserved;
 - guarded semantic refreshes without stale overlays or background request
   loops;
+- keeps semantic colors after editor/appearance settings are reapplied;
+- tracks real text generations separately from Qt formatting revisions and
+  automatically retries stale or cancelled semantic-token responses;
+- flushes LSP requests queued while clangd is still starting;
 - stale-response, UTF-16, URI, transport, and editor-lifetime fixes;
 - includes a sanitized Dracula/JetBrains Mono/clang-format configuration and
   the personal GNU++20 template.
