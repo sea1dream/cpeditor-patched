@@ -17,6 +17,9 @@ portable layout and adds fixes developed for competitive-programming use.
   variables, constants, keywords, and operators.
 - Adds Dracula-compatible operator colors and rainbow bracket pairs while
   keeping comments, strings, numbers, and `#include` paths intact.
+- Recovers a stale clangd C++ AST by reopening the current in-memory draft
+  once, then performs one delayed semantic-highlight retry without flooding
+  the message panel with transient `invalid AST` errors.
 - Handles split/combined LSP frames, unique request IDs, UTF-16 positions,
   stale responses, and document/tab lifetime changes.
 

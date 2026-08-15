@@ -65,6 +65,7 @@ class LanguageServer : public QObject
     bool shouldCreateClient();
     void scheduleSemanticTokens();
     void requestSemanticTokens();
+    void recoverSemanticDocument();
     void syncDocument(bool wantDiagnostics);
     void handleInitializeResponse(const QJsonValue &result);
     void handleSemanticTokensResponse(const QJsonValue &result);
@@ -97,6 +98,7 @@ class LanguageServer : public QObject
     QPointer<Editor::CodeEditor> semanticTokensEditor;
     quint64 semanticTokensGeneration = 0;
     quint64 semanticTokensAttachmentGeneration = 0;
+    bool semanticInvalidAstRecoveryAttempted = false;
     QMetaObject::Connection semanticChangeConnection;
 };
 } // namespace Extensions

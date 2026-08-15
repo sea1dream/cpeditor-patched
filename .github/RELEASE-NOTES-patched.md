@@ -1,4 +1,4 @@
-## CP Editor 7.0.2 patched.3
+## CP Editor 7.0.2 patched.4
 
 Unofficial personal Windows x64 portable build based on CP Editor 7.0.2.
 
@@ -17,6 +17,8 @@ Highlights:
 - keeps semantic colors after editor/appearance settings are reapplied;
 - tracks real text generations separately from Qt formatting revisions and
   automatically retries stale or cancelled semantic-token responses;
+- automatically repairs a stale clangd C++ AST with one bounded in-memory
+  document reopen and suppresses transient `invalid AST` message-panel spam;
 - flushes LSP requests queued while clangd is still starting;
 - stale-response, UTF-16, URI, transport, and editor-lifetime fixes;
 - includes a sanitized Dracula/JetBrains Mono/clang-format configuration and

@@ -30,6 +30,9 @@ namespace Extensions
 {
 namespace
 {
+constexpr int SEMANTIC_TOKENS_DEBOUNCE_MS = 150;
+constexpr int INVALID_AST_RETRY_DELAY_MS = 500;
+
 std::string localFileUri(const QString &path)
 {
     return QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toString(QUrl::FullyEncoded).toStdString();
@@ -83,13 +86,19 @@ Editor::SemanticHighlightKind semanticHighlightKind(const QString &tokenType)
         return Kind::Comment;
     return Kind::Unknown;
 }
+
+bool isInvalidAstError(int errorCode, const QJsonObject &error)
+{
+    return errorCode == -32001 &&
+           error.value("message").toString().contains(QStringLiteral("invalid AST"), Qt::CaseInsensitive);
+}
 } // namespace
 
 LanguageServer::LanguageServer(QString const &lang)
 {
     LOG_INFO(INFO_OF(lang));
     this->language = lang;
-    semanticTokensTimer.setInterval(150);
+    semanticTokensTimer.setInterval(SEMANTIC_TOKENS_DEBOUNCE_MS);
     semanticTokensTimer.setSingleShot(true);
     connect(&semanticTokensTimer, &QTimer::timeout, this, &LanguageServer::requestSemanticTokens);
     if (shouldCreateClient())
@@ -129,6 +138,7 @@ void LanguageServer::openDocument(QString const &path, Editor::CodeEditor *edito
     semanticTokensEditor = nullptr;
     semanticTokensGeneration = 0;
     semanticTokensUri.clear();
+    semanticInvalidAstRecoveryAttempted = false;
     lastSyncedRevision = -1;
     lastDiagnosticsRevision = -1;
     disconnect(completionConnection);
@@ -208,6 +218,7 @@ void LanguageServer::closeDocument()
     semanticTokensEditor = nullptr;
     semanticTokensGeneration = 0;
     semanticTokensUri.clear();
+    semanticInvalidAstRecoveryAttempted = false;
     lastSyncedRevision = -1;
     lastDiagnosticsRevision = -1;
 
@@ -328,7 +339,9 @@ void LanguageServer::scheduleSemanticTokens()
     if (language != "C++" || lsp == nullptr || m_editor.isNull() || !isDocumentOpen())
         return;
 
-    semanticTokensTimer.start();
+    // start(int) also restores the normal debounce interval after a delayed
+    // invalid-AST recovery attempt.
+    semanticTokensTimer.start(SEMANTIC_TOKENS_DEBOUNCE_MS);
 }
 
 void LanguageServer::requestSemanticTokens()
@@ -349,6 +362,33 @@ void LanguageServer::requestSemanticTokens()
     semanticTokensGeneration = contentGeneration;
     semanticTokensUri = uriString;
     semanticTokensAttachmentGeneration = attachmentGeneration;
+}
+
+void LanguageServer::recoverSemanticDocument()
+{
+    if (language != "C++" || lsp == nullptr || m_editor.isNull() || !isDocumentOpen())
+        return;
+
+    const std::string uri = localFileUri(openFile);
+
+    // clangd can occasionally retain an open draft while losing the AST that
+    // backs it. A full in-memory close/open cycle rebuilds that translation
+    // unit without forcing the user to save the source file. Invalidate every
+    // pending request from the old document epoch before reopening it.
+    semanticTokensTimer.stop();
+    latestSemanticTokensRequestId.clear();
+    semanticTokensEditor = nullptr;
+    semanticTokensUri.clear();
+    latestCompletionRequestId.clear();
+    completionEditor = nullptr;
+    m_editor->hideCompletionPopup();
+
+    lsp->didClose(uri);
+    lsp->didOpen(uri, m_editor->toPlainText().toStdString(), "cpp");
+    lastSyncedRevision = m_editor->document()->revision();
+    lastDiagnosticsRevision = -1;
+
+    semanticTokensTimer.start(INVALID_AST_RETRY_DELAY_MS);
 }
 
 void LanguageServer::syncDocument(bool wantDiagnostics)
@@ -390,7 +430,7 @@ void LanguageServer::handleInitializeResponse(const QJsonValue &result)
         lsp->initialized();
 
     if (!semanticTokenTypes.isEmpty() && !m_editor.isNull() && isDocumentOpen())
-        semanticTokensTimer.start();
+        scheduleSemanticTokens();
 }
 
 void LanguageServer::handleSemanticTokensResponse(const QJsonValue &result)
@@ -452,6 +492,7 @@ void LanguageServer::handleSemanticTokensResponse(const QJsonValue &result)
     }
 
     semanticTokensEditor->setSemanticHighlights(highlights, semanticTokensGeneration);
+    semanticInvalidAstRecoveryAttempted = false;
     LOG_INFO("Applied " << highlights.size() << " semantic highlights for text generation "
                          << semanticTokensGeneration);
 }
@@ -585,10 +626,39 @@ void LanguageServer::onLSPServerRequestArrived(QString const &method, // NOLINT:
 void LanguageServer::onLSPServerErrorArrived(QString const &id, QJsonObject const &error)
 {
     const int errorCode = error.value("code").toInt();
+    const bool invalidAst = isInvalidAstError(errorCode, error);
     if (id.startsWith("textDocument/semanticTokens/full:"))
     {
         if (id != latestSemanticTokensRequestId)
             return;
+        if (invalidAst)
+        {
+            if (semanticTokensEditor.isNull() || semanticTokensEditor != m_editor ||
+                semanticTokensAttachmentGeneration != attachmentGeneration)
+            {
+                return;
+            }
+
+            if (semanticTokensEditor->semanticContentGeneration() != semanticTokensGeneration)
+            {
+                scheduleSemanticTokens();
+                return;
+            }
+
+            if (!semanticInvalidAstRecoveryAttempted)
+            {
+                semanticInvalidAstRecoveryAttempted = true;
+                LOG_WARN("Language server temporarily lost the C++ AST; reopening the in-memory document once");
+                recoverSemanticDocument();
+            }
+            else
+            {
+                // If rebuilding still fails, wait for the next edit instead
+                // of reopening forever or filling the user-visible logger.
+                LOG_INFO("C++ AST is still unavailable after recovery; waiting for the next document change");
+            }
+            return;
+        }
         if (errorCode == -32800 || errorCode == -32801)
         {
             scheduleSemanticTokens();
@@ -596,7 +666,7 @@ void LanguageServer::onLSPServerErrorArrived(QString const &id, QJsonObject cons
         }
     }
     if (id.startsWith("textDocument/completion:") &&
-        (id != latestCompletionRequestId || errorCode == -32800 || errorCode == -32801))
+        (id != latestCompletionRequestId || errorCode == -32800 || errorCode == -32801 || invalidAst))
     {
         // Superseded completion requests are routinely cancelled by language
         // servers while the user keeps typing. They are not user-facing errors.
